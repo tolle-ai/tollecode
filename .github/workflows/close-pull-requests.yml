@@ -1,0 +1,55 @@
+name: Close pull requests
+
+# TolleCode isn't accepting outside code yet (see CONTRIBUTING.md). Branch protection
+# stops pull requests merging but not opening, so this closes them with an explanation
+# instead of leaving contributors waiting on a review that isn't coming.
+#
+# pull_request_target is deliberate: a `pull_request` run triggered from a fork gets a
+# read-only GITHUB_TOKEN and could neither comment nor close. The usual danger with
+# pull_request_target is that it runs with write permissions in the context of the base
+# repo — this job never checks out, builds, or executes any PR content, which is what
+# makes it safe here. Do not add a checkout step to this file.
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    # Leave maintainers' own pull requests alone — the project may use them internally
+    # even while outside contributions are closed.
+    if: >-
+      github.event.pull_request.author_association != 'OWNER' &&
+      github.event.pull_request.author_association != 'MEMBER' &&
+      github.event.pull_request.author_association != 'COLLABORATOR'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr comment "$PR_URL" --body "$(cat <<'EOF'
+          Thanks for taking the time to write this, and sorry that it's an automated reply.
+
+          **TolleCode isn't accepting outside code yet**, so I'm closing this rather than
+          leaving it open against a review that isn't coming. That's about the project's
+          setup, not your patch.
+
+          The reason is licensing groundwork rather than lack of interest: the same code
+          ships in commercial builds, so contributions need a signed CLA before they can
+          be merged, and that isn't in place yet.
+          [CLA.md](https://github.com/tolle-ai/tollecode/blob/main/CLA.md) describes the
+          agreement that will apply — you keep the copyright in your work.
+
+          **What genuinely helps right now:
+          [open an issue](https://github.com/tolle-ai/tollecode/issues).** Bug reports and
+          feature requests are read and acted on. If this pull request fixes something
+          real, please describe the problem in an issue — when contributions open, that's
+          the list we'll work from, and you'll have first claim on it.
+          EOF
+          )"
+          gh pr close "$PR_URL"
