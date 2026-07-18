@@ -46,9 +46,13 @@ go vet ./...
 go test ./...
 ```
 
-CI runs all three on Linux, macOS, and Windows. Cross-platform matters here — the CLI
-does terminal, PTY, and filesystem work that diverges across platforms, so please
-avoid POSIX-only assumptions in `internal/agent` and `internal/shellenv`.
+CI builds and tests on Linux and macOS; `gofmt` and `go vet` are on you.
+
+Windows is a supported target but is **not** covered by CI, so nothing catches a
+Windows regression automatically. The CLI does terminal, PTY, and filesystem work that
+diverges sharply across platforms — please avoid POSIX-only assumptions in
+`internal/agent` and `internal/shellenv`, and if you touch those, say in your report
+whether you were able to check Windows.
 
 ## Repository layout
 
