@@ -1,0 +1,25 @@
+# Compiled binaries — never commit these. Build artifacts in git history are what
+# made the private monorepo's .git grow to 2.8 GB.
+/tollecode
+/tollecode.exe
+/tollecode-server
+/tollecode-sidecar*
+/go-sidecar
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test and coverage output
+*.test
+*.out
+coverage.*
+
+# Staged web UI build (see internal/webmode) — only the placeholder is tracked
+/internal/webmode/dist/browser/*
+!/internal/webmode/dist/browser/.gitignore
+!/internal/webmode/dist/browser/placeholder.html
+
+# Local environment
+.env
+.DS_Store

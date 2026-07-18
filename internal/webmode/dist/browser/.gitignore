@@ -1,0 +1,8 @@
+# The real Lite UI is staged here at build time (scripts/build-lite-web.sh / the
+# build-lite-web-ui CI job) — index.html plus content-hashed chunks. Commit only
+# placeholder.html so go:embed always has a file to compile; ignore everything
+# else (including the real index.html) so multi-megabyte build output — and a
+# real index.html that would make this look like a shipped UI — never land in git.
+*
+!.gitignore
+!placeholder.html

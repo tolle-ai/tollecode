@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Tollecode Lite (web)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <!--
+      This file exists only so //go:embed dist/browser always has at least one
+      file to embed (a fresh checkout has no real UI). It is deliberately NOT
+      index.html: web mode serves the SPA only when index.html is present, so a
+      binary built without staging the UI correctly reports "UI not embedded"
+      rather than serving this page as the app.
+
+      The real Angular Lite build is staged over this directory at build time by
+      scripts/build-lite-web.sh (locally) or the build-lite-web-ui CI job. Only
+      this placeholder is committed (see .gitignore); the real assets are
+      regenerated so the embedded UI never ships stale.
+    -->
+    <main style="font-family: system-ui; max-width: 40rem; margin: 4rem auto; padding: 0 1rem;">
+      <h1>Tollecode Lite — web mode</h1>
+      <p>This binary was built without the Angular UI staged. Run
+         <code>scripts/build-lite-web.sh</code> to embed it.</p>
+    </main>
+  </body>
+</html>
