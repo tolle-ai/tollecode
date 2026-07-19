@@ -131,6 +131,44 @@ func TestComposerInputLineFitsWidth(t *testing.T) {
 	}
 }
 
+// TestComposerInputLineCaret: the caret is painted (reverse video) rather than
+// moved to, since the real cursor stays in the scroll region during a turn. It
+// must be visible at every position, and the row must stay strictly inside the
+// terminal width at every caret position — touching the last column makes the
+// terminal wrap the pinned row.
+func TestComposerInputLineCaret(t *testing.T) {
+	c := testComposer()
+	c.w = 40
+	c.buf = []rune("hello")
+
+	for _, cur := range []int{0, 1, 5} {
+		c.cur = cur
+		line := c.inputLine()
+		if !strings.Contains(line, ansiReverse) {
+			t.Errorf("cur=%d: no caret rendered: %q", cur, line)
+		}
+	}
+	// An empty buffer still shows a caret to type at.
+	c.buf, c.cur = nil, 0
+	if line := c.inputLine(); !strings.Contains(line, ansiReverse) {
+		t.Errorf("empty buffer has no caret: %q", line)
+	}
+
+	// A buffer far wider than the row scrolls horizontally: the caret stays
+	// visible and the row never reaches the last column.
+	c.buf = []rune(strings.Repeat("abcde", 40))
+	for _, cur := range []int{0, 1, 37, 60, 199, 200} {
+		c.cur = cur
+		line := c.inputLine()
+		if !strings.Contains(line, ansiReverse) {
+			t.Errorf("cur=%d: caret scrolled out of view: %q", cur, line)
+		}
+		if got := visibleWidth(line); got >= c.w {
+			t.Errorf("cur=%d: input row reaches the last column: %d >= %d", cur, got, c.w)
+		}
+	}
+}
+
 // TestComposerResizeClearsStalePinnedRows: when the terminal grows taller,
 // the pinned rows drawn at the old bottom land inside the new content area —
 // resize must erase them or they linger mid-screen as ghost rule/❯/hint lines.
@@ -140,16 +178,17 @@ func TestComposerResizeClearsStalePinnedRows(t *testing.T) {
 
 	c.resizeTo(213, 64)
 
-	// Old pinned rows (23, 24, 25 for h=25) must be moved-to and cleared.
-	for _, row := range []int{23, 24, 25} {
+	// Every pinned row at the old bottom must be moved-to and cleared.
+	for row := 25 - composerReservedRows + 1; row <= 25; row++ {
 		want := fmt.Sprintf("\033[%d;1H\033[2K", row)
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("resize did not clear stale pinned row %d: %q", row, out.String())
 		}
 	}
-	// And the region must be re-issued for the new height (64 - 3 = 61).
-	if !strings.Contains(out.String(), "\033[1;61r") {
-		t.Fatalf("resize did not re-issue the region: %q", out.String())
+	// And the region must be re-issued for the new height.
+	wantRegion := fmt.Sprintf("\033[1;%dr", 64-composerReservedRows)
+	if !strings.Contains(out.String(), wantRegion) {
+		t.Fatalf("resize did not re-issue the region %q: %q", wantRegion, out.String())
 	}
 
 	// Shrinking must NOT emit clears for rows beyond the new screen (they
@@ -158,6 +197,38 @@ func TestComposerResizeClearsStalePinnedRows(t *testing.T) {
 	c.resizeTo(94, 25)
 	if strings.Contains(out.String(), "\033[62;1H\033[2K") {
 		t.Fatalf("shrink resize cleared off-screen rows: %q", out.String())
+	}
+}
+
+// TestComposerEmergencyResetWipesPinnedRows: the force-quit path (double
+// Ctrl-C → os.Exit, which skips the deferred teardown) must leave the terminal
+// as clean as teardown does. Dropping the scroll region is not enough — without
+// an erase the pinned rows stay painted on screen after the process is gone.
+func TestComposerEmergencyResetWipesPinnedRows(t *testing.T) {
+	var out strings.Builder
+	c := &composer{out: &out, enabled: true, active: true, h: 25, w: 94}
+
+	c.emergencyReset()
+	got := out.String()
+
+	firstPinned := 25 - composerReservedRows + 1
+	want := fmt.Sprintf("\033[r\033[%d;1H\033[J", firstPinned)
+	if got != want {
+		t.Fatalf("emergencyReset = %q, want %q", got, want)
+	}
+	// The region reset must precede the absolute move: while a region is
+	// installed, a move to a row outside it is clamped, so erasing would start
+	// from the wrong row and leave the composer behind.
+	if strings.Index(got, "\033[r") > strings.Index(got, ";1H") {
+		t.Errorf("region reset must come before the cursor move: %q", got)
+	}
+
+	// A composer too short to have ever pinned must emit nothing rather than
+	// address row 0 or a negative row.
+	out.Reset()
+	(&composer{out: &out, h: 2}).emergencyReset()
+	if out.String() != "" {
+		t.Errorf("emergencyReset on an unpinnable composer wrote %q", out.String())
 	}
 }
 

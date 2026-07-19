@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tolle-ai/tollecode/internal/session"
@@ -30,6 +31,10 @@ const (
 	ansiBold   = "\033[1m"
 	ansiDim    = "\033[2m"
 	ansiItalic = "\033[3m"
+	// ansiReverse draws the composer caret. The real terminal cursor lives in
+	// the scroll region during a turn (Invariant 1), so the caret on the pinned
+	// input row has to be painted rather than moved to.
+	ansiReverse = "\033[7m"
 )
 
 func ansiRGB(r, g, b int) string {
@@ -1379,6 +1384,35 @@ func formatLoaderElapsed(d time.Duration) string {
 	}
 }
 
+// activeLoader points at the running loader, for code that can't reach the
+// StreamRenderer but must not print over the status line (printAboveLoader).
+// Mirrors activeComposer's role for the pinned rows.
+var activeLoader atomic.Pointer[gradientLoader]
+
+// printAboveLoader writes s to stdout without colliding with the status line.
+//
+// The loader parks the cursor mid-line with no trailing newline, so any write
+// that skips this path lands ON the status line and its newline commits that
+// composite line to scrollback — which is why an unsynchronized writer makes
+// the loader appear to repeat once per message. Callers outside the
+// HandleEvent branches (which already pause/resume themselves) must route
+// through here. Safe when no loader is running: it degrades to a plain print.
+func printAboveLoader(s string) {
+	l := activeLoader.Load()
+	if l == nil {
+		fmt.Print(s)
+		return
+	}
+	// pause() is idempotent and clears the line; resume() only lifts the draw
+	// block, so a loader the caller found already-paused stays visually clean.
+	wasPaused := l.isPaused()
+	l.pause()
+	fmt.Print(s)
+	if !wasPaused {
+		l.resume()
+	}
+}
+
 type gradientLoader struct {
 	mu            sync.Mutex
 	paused        bool
@@ -1411,6 +1445,7 @@ func (l *gradientLoader) start(effortLabel string) {
 	l.word = randomLoaderWord()
 	l.wordChangedAt = l.startedAt
 	l.effortLabel = effortLabel
+	activeLoader.Store(l)
 	go l.run()
 }
 
@@ -1438,13 +1473,24 @@ func (l *gradientLoader) stop() {
 	l.mu.Unlock()
 	close(stopCh)
 	<-doneCh // wait for goroutine to clear the line and exit
+	// CompareAndSwap, not an unconditional clear: a start() for the next turn
+	// may already have claimed the slot.
+	activeLoader.CompareAndSwap(l, nil)
 }
 
 // pause immediately clears the status line and prevents further draws. Every
 // HandleEvent branch calls this before printing, so the line and any other
 // output are never visible at the same instant — a plain clear-current-line
 // is enough; nothing needs to hunt for the terminal's last row.
+//
+// Under the pinned composer this is a no-op: the status row sits outside the
+// scroll region, so content prints can't collide with it and the loader should
+// stay visible and ticking across them rather than blinking out on every tool
+// result.
 func (l *gradientLoader) pause() {
+	if activeComposer.Load().isActive() {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.paused {
@@ -1463,6 +1509,15 @@ func (l *gradientLoader) resume() {
 	l.paused = false
 }
 
+// isPaused reports whether draws are currently blocked, so printAboveLoader can
+// leave an already-paused loader paused instead of resuming it behind the back
+// of the HandleEvent branch that paused it.
+func (l *gradientLoader) isPaused() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.paused
+}
+
 func (l *gradientLoader) run() {
 	defer close(l.doneCh)
 	frame := 0
@@ -1478,6 +1533,9 @@ func (l *gradientLoader) run() {
 				l.lineVisible = false
 			}
 			l.mu.Unlock()
+			// Blank the pinned status row so it doesn't strand the last frame
+			// between turns. Outside the lock — setStatus takes the composer's.
+			activeComposer.Load().setStatus("")
 			return
 		case <-ticker.C:
 			l.mu.Lock()
@@ -1496,11 +1554,19 @@ func (l *gradientLoader) run() {
 				hint := "(" + strings.Join(parts, " · ") + ")"
 
 				glyphColor := gradientColor((frame / 2) % len(loaderGradient))
-				fmt.Printf("\r\033[2K  %s%s✻%s %s%s…%s  %s%s%s",
+				line := fmt.Sprintf("  %s%s✻%s %s%s…%s  %s%s%s",
 					ansiBold, glyphColor, ansiReset,
 					ansiBold, l.word, ansiReset,
 					ansiDim, hint, ansiReset)
-				l.lineVisible = true
+				if c := activeComposer.Load(); c.isActive() {
+					// Pinned: the status row lives outside the scroll region, so
+					// the loader never shares a line with content and needs no
+					// carriage-return erase.
+					c.setStatus(line)
+				} else {
+					fmt.Print("\r\033[2K" + line)
+					l.lineVisible = true
+				}
 				frame++
 			}
 			l.mu.Unlock()

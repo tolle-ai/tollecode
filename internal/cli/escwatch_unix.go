@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -44,7 +45,26 @@ type keyWatcher struct {
 	pend     []byte // bytes read but not yet resolved (partial escape/UTF-8)
 	inPaste  bool   // inside an ESC[200~ … ESC[201~ bracketed paste
 	pasteAcc []byte // paste content accumulated so far
+
+	// escHeldAt is when the currently-held lone ESC was first seen, zeroed the
+	// moment any byte arrives. A standalone Escape is declared only after
+	// escapeSettle of continuous silence — see resolveIdleEscape.
+	escHeldAt time.Time
+	// escOrphaned records that a lone ESC was just consumed as a standalone
+	// Escape. If its remainder shows up on the very next read after all, that
+	// remainder is the tail of an escape sequence and must be swallowed rather
+	// than typed into the composer as text.
+	escOrphaned bool
 }
+
+// escapeSettle is how long a held ESC must go unaccompanied before it counts as
+// a standalone Escape keypress rather than the opening byte of an arrow/function
+// key. The read loop uses VMIN=1, so the terminal routinely hands over the ESC
+// of a multi-byte sequence on its own — deciding on the first quiet poll would
+// (and did) cancel turns when the rest of the sequence was merely slow, which is
+// normal over SSH, in tmux, or under load. Escape-to-cancel is a destructive
+// action, so it is worth several poll rounds of confirmation.
+const escapeSettle = 150 * time.Millisecond
 
 func startKeyWatch(cancel context.CancelFunc, comp *composer) *keyWatcher {
 	fd := int(os.Stdin.Fd())
@@ -89,8 +109,11 @@ func (w *keyWatcher) run() {
 			return
 		}
 		if !ready {
-			// Nothing arrived after a held lone ESC — it's a real Escape
-			// keypress, not the start of an arrow/function-key sequence.
+			// Nothing arrived after a held lone ESC — it may be a real Escape
+			// keypress rather than the start of an arrow/function-key sequence.
+			// A previously orphaned ESC can no longer be claimed by a tail: the
+			// window for its remainder to show up has now passed.
+			w.escOrphaned = false
 			w.resolveIdleEscape()
 			continue
 		}
@@ -105,18 +128,32 @@ func (w *keyWatcher) run() {
 			continue
 		}
 		w.pend = append(w.pend, buf[:n]...)
+		w.escHeldAt = time.Time{} // bytes arrived — the silence run is broken
 		w.process()
 	}
 }
 
-// resolveIdleEscape fires when a held ESC got no follow-up bytes within the
-// poll window: a standalone Escape. With typed-during-turn text pending it
-// clears the text; otherwise (or on the next press) it cancels the turn.
+// resolveIdleEscape fires when a held ESC got no follow-up bytes within a poll
+// window. It declares a standalone Escape only once the ESC has sat alone for
+// escapeSettle — the first quiet poll merely starts the clock, since the tail
+// of a genuine arrow key can trail its ESC by more than one window. With
+// typed-during-turn text pending a standalone Escape clears the text;
+// otherwise (or on the next press) it cancels the turn.
 func (w *keyWatcher) resolveIdleEscape() {
 	if w.inPaste || len(w.pend) != 1 || w.pend[0] != 0x1b {
 		return
 	}
+	if w.escHeldAt.IsZero() {
+		w.escHeldAt = time.Now()
+		return
+	}
+	if time.Since(w.escHeldAt) < escapeSettle {
+		return
+	}
 	w.pend = w.pend[:0]
+	w.escHeldAt = time.Time{}
+	// If the tail turns up on the next read after all, it belongs to this ESC.
+	w.escOrphaned = true
 	if w.comp.clearBuf() {
 		return
 	}
@@ -133,6 +170,21 @@ func (w *keyWatcher) process() {
 				return
 			}
 			continue
+		}
+		if w.escOrphaned {
+			// A lone ESC was resolved as a standalone Escape and its remainder
+			// arrived late. Swallow the tail — without this it lands in the
+			// composer as literal "[D" / "OD" / "[1;5D".
+			switch n := consumeOrphanTail(w.pend); {
+			case n > 0:
+				w.pend = w.pend[n:]
+				w.escOrphaned = false
+				continue
+			case n < 0:
+				return // viable tail prefix — wait for the rest
+			default:
+				w.escOrphaned = false // ordinary input; fall through
+			}
 		}
 		c := w.pend[0]
 		if c == 0x1b {
@@ -152,7 +204,8 @@ func (w *keyWatcher) process() {
 			if consumed == 0 {
 				return // lone/partial ESC — resolved by the idle timeout
 			}
-			w.pend = w.pend[consumed:] // arrow keys etc. — ignore
+			w.applyEditKey(classifyEditKey(w.pend[:consumed]))
+			w.pend = w.pend[consumed:]
 			continue
 		}
 		switch {
@@ -164,6 +217,21 @@ func (w *keyWatcher) process() {
 			w.pend = w.pend[1:]
 		case c == 0x15: // Ctrl-U — clear the line
 			w.comp.clearBuf()
+			w.pend = w.pend[1:]
+		case c == 0x01: // Ctrl-A — start of line
+			w.comp.moveCursorTo(0)
+			w.pend = w.pend[1:]
+		case c == 0x05: // Ctrl-E — end of line
+			w.comp.moveCursorTo(-1)
+			w.pend = w.pend[1:]
+		case c == 0x17: // Ctrl-W — delete the word before the caret
+			w.comp.deleteWordBack()
+			w.pend = w.pend[1:]
+		case c == 0x02: // Ctrl-B — back one char (readline convention)
+			w.comp.moveCursor(-1)
+			w.pend = w.pend[1:]
+		case c == 0x06: // Ctrl-F — forward one char
+			w.comp.moveCursor(1)
 			w.pend = w.pend[1:]
 		case c < 0x20: // other control bytes (incl. Ctrl-C, owned by ISIG) — ignore
 			w.pend = w.pend[1:]
@@ -235,6 +303,100 @@ func consumeEscSequence(p []byte) int {
 	default: // Alt+key or a stray two-byte pair
 		return 2
 	}
+}
+
+// editKey is a line-editing action decoded from an escape sequence or control
+// byte. Up/Down deliberately have no entry: the composer is a single row, and
+// history recall belongs to the idle readline prompt.
+type editKey int
+
+const (
+	keyNone editKey = iota
+	keyLeft
+	keyRight
+	keyWordLeft
+	keyWordRight
+	keyHome
+	keyEnd
+	keyDelete
+)
+
+// classifyEditKey decodes a complete escape sequence into an editing action.
+// It accepts both CSI (ESC[) and SS3 (ESCO) encodings — terminals switch
+// between them depending on application/cursor-key mode — and the modified
+// CSI 1;<mod> forms that Ctrl/Alt+arrow produce.
+func classifyEditKey(seq []byte) editKey {
+	if len(seq) < 3 || seq[0] != 0x1b || (seq[1] != '[' && seq[1] != 'O') {
+		return keyNone
+	}
+	final := seq[len(seq)-1]
+	params := string(seq[2 : len(seq)-1])
+	// A modifier parameter (ESC[1;5D and friends) promotes arrows to word-wise
+	// motion. Any modifier will do — Ctrl and Alt are both used in the wild.
+	modified := strings.Contains(params, ";")
+	switch final {
+	case 'D':
+		if modified {
+			return keyWordLeft
+		}
+		return keyLeft
+	case 'C':
+		if modified {
+			return keyWordRight
+		}
+		return keyRight
+	case 'H':
+		return keyHome
+	case 'F':
+		return keyEnd
+	case '~':
+		switch params {
+		case "1", "7":
+			return keyHome
+		case "4", "8":
+			return keyEnd
+		case "3":
+			return keyDelete
+		}
+	}
+	return keyNone
+}
+
+// applyEditKey routes a decoded action to the composer.
+func (w *keyWatcher) applyEditKey(k editKey) {
+	switch k {
+	case keyLeft:
+		w.comp.moveCursor(-1)
+	case keyRight:
+		w.comp.moveCursor(1)
+	case keyWordLeft:
+		w.comp.moveWord(-1)
+	case keyWordRight:
+		w.comp.moveWord(1)
+	case keyHome:
+		w.comp.moveCursorTo(0)
+	case keyEnd:
+		w.comp.moveCursorTo(-1)
+	case keyDelete:
+		w.comp.deleteForward()
+	}
+}
+
+// consumeOrphanTail reports how to treat p when the ESC that opened it was
+// already consumed as a standalone Escape: a positive length for a complete
+// headless CSI/SS3 tail, -1 when p is a viable tail that needs more bytes, and
+// 0 when p is ordinary input that has nothing to do with the lost ESC.
+func consumeOrphanTail(p []byte) int {
+	if len(p) == 0 || (p[0] != '[' && p[0] != 'O') {
+		return 0
+	}
+	// Re-attach a synthetic ESC so the existing parser decides, keeping one
+	// definition of what a complete sequence looks like.
+	n := consumeEscSequence(append([]byte{0x1b}, p...))
+	if n == 0 {
+		return -1
+	}
+	return n - 1
 }
 
 func (w *keyWatcher) trigger() {

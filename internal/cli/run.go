@@ -33,6 +33,9 @@ func Run(cfg Config) {
 	// before any request — the CLI doesn't go through the stdio state constructor
 	// where the desktop/web modes do this.
 	ai.SyncEgressFromSettings()
+	// Route findings through the loader-safe, deduping sink — the ai default
+	// writes raw stderr, which corrupts the status line (see egresssink.go).
+	installEgressSink()
 
 	// Auto-connect locally-running MCP backends (e.g. Blender, Unity) for the interactive
 	// REPL, one-shot --task, and `launch` — the same as Lite. Server modes

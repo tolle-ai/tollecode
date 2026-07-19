@@ -32,13 +32,33 @@ import (
 //     variant that skips the input row and ends with an absolute move back to
 //     it instead of DECRC.
 
-// composerReservedRows is the pinned area height: rule + input + hints.
-const composerReservedRows = 3
+// composerReservedRows is the pinned area height. Bottom-up the rows are:
+//
+//	h-4  status   — the turn loader (pinned here, not printed inline, so it
+//	               stays put instead of scrolling away with the transcript)
+//	h-3  rule     — top border of the composer box
+//	h-2  input    — the prompt row (owned by readline while idle-editing)
+//	h-1  rule     — bottom border, separating the box from the hints
+//	h    hints    — mode · model · shortcuts
+const composerReservedRows = 5
+
+// Row offsets from the terminal's last row, indexing the layout above.
+const (
+	rowHints      = 0
+	rowRuleBottom = 1
+	rowInput      = 2
+	rowRuleTop    = 3
+	rowStatus     = 4
+)
+
+// row converts a rowX offset into an absolute terminal row.
+func (c *composer) row(offset int) int { return c.h - offset }
 
 // composerMinRows/Cols are the smallest terminal the pinned layout makes
-// sense in; anything smaller falls back to the legacy inline prompt.
+// sense in; anything smaller falls back to the legacy inline prompt. The
+// minimum leaves at least four content rows above the pinned area.
 const (
-	composerMinRows = 9
+	composerMinRows = composerReservedRows + 4
 	composerMinCols = 20
 )
 
@@ -58,8 +78,13 @@ type composer struct {
 	mode, model, agentLabel string
 	activeSkills            []string
 
+	// status is the pinned status row's content — the loader's rendered line
+	// while a turn runs, empty when idle (setStatus).
+	status string
+
 	// During-turn input state, fed by the key watcher.
 	buf    []rune   // unsubmitted composer text
+	cur    int      // caret position in buf, 0..len(buf) (len == at the end)
 	queued []string // Enter-queued messages, drained by the REPL after the turn
 
 	idleInput        bool // readline currently editing on the input row
@@ -107,8 +132,10 @@ func (c *composer) setup() {
 		// Cursor already inside the future pinned area (terminal was full),
 		// or its position is unknown: reserve the pinned rows while the whole
 		// screen still scrolls (pushing existing content above them), then
-		// install the region and resume at the region bottom.
-		fmt.Fprintf(c.out, "\n\n\n\033[1;%dr\033[%d;1H", h-composerReservedRows, h-composerReservedRows)
+		// install the region and resume at the region bottom. The newline run
+		// must track composerReservedRows — one per reserved row.
+		fmt.Fprintf(c.out, "%s\033[1;%dr\033[%d;1H",
+			strings.Repeat("\n", composerReservedRows), h-composerReservedRows, h-composerReservedRows)
 	}
 	c.redrawLocked()
 	c.mu.Unlock()
@@ -140,15 +167,21 @@ func (c *composer) teardown() {
 	activeComposer.Store(nil)
 }
 
-// emergencyReset is the force-quit path (os.Exit skips deferred teardown):
-// one unconditional write that drops the region and parks the cursor on the
-// last row. Deliberately lock-free — it must work from a signal handler even
+// emergencyReset is the force-quit path (os.Exit skips deferred teardown): one
+// unconditional write that drops the scroll region and wipes the pinned rows,
+// leaving the cursor where the conversation content ended so the shell prompt
+// lands there. Deliberately lock-free — it must work from a signal handler even
 // if the composer mutex is held.
+//
+// Order matters: the region reset comes FIRST so the absolute move can address
+// rows inside the former pinned area (a move is clamped to the region while one
+// is installed), then ESC[J erases from the top of that area down. Without the
+// erase the composer stays painted on screen after the process exits.
 func (c *composer) emergencyReset() {
-	if c == nil {
+	if c == nil || c.h <= composerReservedRows {
 		return
 	}
-	fmt.Fprintf(c.out, "\033[r\033[%d;1H\n", c.h)
+	fmt.Fprintf(c.out, "\033[r\033[%d;1H\033[J", c.h-composerReservedRows+1)
 }
 
 // isActive reports whether the pinned layout is currently installed.
@@ -192,25 +225,55 @@ func (c *composer) redrawLocked() {
 	if !c.idleInput {
 		b.WriteString("\0337") // DECSC — matched by the DECRC below (Invariant 2)
 	}
-	// Rule row.
-	fmt.Fprintf(&b, "\033[%d;1H\033[2K", c.h-2)
+	// Status row — the loader parks here while a turn runs; blank when idle.
+	fmt.Fprintf(&b, "\033[%d;1H\033[2K", c.row(rowStatus))
+	b.WriteString(c.status)
+	// Top rule.
+	fmt.Fprintf(&b, "\033[%d;1H\033[2K", c.row(rowRuleTop))
 	b.WriteString(c.ruleLine())
 	// Input row — owned by readline while idle-editing (Invariant 3).
 	if !c.idleInput {
-		fmt.Fprintf(&b, "\033[%d;1H\033[2K", c.h-1)
+		fmt.Fprintf(&b, "\033[%d;1H\033[2K", c.row(rowInput))
 		b.WriteString(c.inputLine())
 	}
+	// Bottom rule — separates the input box from the hints below it.
+	fmt.Fprintf(&b, "\033[%d;1H\033[2K", c.row(rowRuleBottom))
+	b.WriteString(c.ruleLine())
 	// Hint row.
-	fmt.Fprintf(&b, "\033[%d;1H\033[2K", c.h)
+	fmt.Fprintf(&b, "\033[%d;1H\033[2K", c.row(rowHints))
 	b.WriteString(c.hintLine())
 	if c.idleInput {
 		// Leave the cursor on the input row for readline; the caller triggers
 		// rl.Refresh() when this runs mid-edit (resize).
-		fmt.Fprintf(&b, "\033[%d;1H", c.h-1)
+		fmt.Fprintf(&b, "\033[%d;1H", c.row(rowInput))
 	} else {
 		b.WriteString("\0338") // DECRC
 	}
 	io.WriteString(c.out, b.String())
+}
+
+// setStatus updates the pinned status row (the loader's line) and repaints it
+// alone — this runs on the loader's 70ms ticker, so it must not redraw the
+// whole pinned block. Invariant 2 applies: one write, DECSC/DECRC bracketed.
+func (c *composer) setStatus(s string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.active || s == c.status {
+		return
+	}
+	c.status = s
+	// While readline edits, the DECSC slot belongs to beginIdleInput's
+	// long-lived bracket (Invariant 3) — end with an absolute move back to the
+	// input row instead of clobbering it with a DECRC.
+	if c.idleInput {
+		fmt.Fprintf(c.out, "\033[%d;1H\033[2K%s\033[%d;1H",
+			c.row(rowStatus), s, c.row(rowInput))
+		return
+	}
+	fmt.Fprintf(c.out, "\0337\033[%d;1H\033[2K%s\0338", c.row(rowStatus), s)
 }
 
 func (c *composer) ruleLine() string {
@@ -244,11 +307,58 @@ func (c *composer) inputLine() string {
 		avail = 4
 	}
 	// Newlines (multi-line pastes) render compactly on the single input row.
-	text := strings.ReplaceAll(string(c.buf), "\n", "⏎")
-	if rr := []rune(text); len(rr) > avail {
-		text = "…" + string(rr[len(rr)-avail+1:]) // show the tail being typed
+	// The replacement is rune-for-rune, so caret indices carry over unchanged.
+	runes := []rune(strings.ReplaceAll(string(c.buf), "\n", "⏎"))
+	cur := c.cur
+	if cur < 0 {
+		cur = 0
 	}
-	line := "  " + promptColor + ansiBold + "❯" + ansiReset + " " + text
+	if cur > len(runes) {
+		cur = len(runes)
+	}
+
+	// Horizontal window: scroll the view so the caret stays visible on a buffer
+	// longer than the row. One cell is reserved for a caret sitting past the
+	// last character, which is where it is while you are simply typing.
+	win := avail
+	if win < 2 {
+		win = 2
+	}
+	start := 0
+	if cur >= win {
+		start = cur - win + 1
+	}
+	if start > 0 {
+		// A leading "…" marks the scrolled-off text and costs a cell, so the
+		// window has to give one back — otherwise the row overruns into the
+		// terminal's last column and wraps.
+		if win > 1 {
+			win--
+		}
+		if start = cur - win + 1; start < 0 {
+			start = 0
+		}
+	}
+	end := start + win
+	if end > len(runes) {
+		end = len(runes)
+	}
+
+	var text strings.Builder
+	if start > 0 {
+		text.WriteString(ansiDim + "…" + ansiReset)
+	}
+	for i := start; i < end; i++ {
+		if i == cur {
+			text.WriteString(ansiReverse + string(runes[i]) + ansiReset)
+			continue
+		}
+		text.WriteRune(runes[i])
+	}
+	if cur >= end {
+		text.WriteString(ansiReverse + " " + ansiReset) // caret past the last rune
+	}
+	line := "  " + promptColor + ansiBold + "❯" + ansiReset + " " + text.String()
 	if queuedNote != "" {
 		pad := c.w - 1 - visibleWidth(line) - visibleWidth(queuedNote)
 		if pad < 1 {
@@ -275,7 +385,7 @@ func (c *composer) beginIdleInput() {
 	}
 	c.idleInput = true
 	c.savedCursorValid = true
-	fmt.Fprintf(c.out, "\0337\033[%d;1H\033[2K", c.h-1)
+	fmt.Fprintf(c.out, "\0337\033[%d;1H\033[2K", c.row(rowInput))
 }
 
 // endIdleInput takes the input row back after Readline returns and restores
@@ -291,9 +401,14 @@ func (c *composer) endIdleInput() {
 		return
 	}
 	c.idleInput = false
-	// A long input may have wrapped onto the hint row — clear both rows;
-	// redrawLocked repaints them right after.
-	fmt.Fprintf(c.out, "\033[%d;1H\033[2K\033[%d;1H\033[2K", c.h-1, c.h)
+	// A long input may have wrapped past the input row onto the rows below it
+	// — clear the input row and everything under it; redrawLocked repaints
+	// them right after.
+	var b strings.Builder
+	for off := rowInput; off >= rowHints; off-- {
+		fmt.Fprintf(&b, "\033[%d;1H\033[2K", c.row(off))
+	}
+	io.WriteString(c.out, b.String())
 	if c.savedCursorValid {
 		io.WriteString(c.out, "\0338")
 	} else {
@@ -306,7 +421,7 @@ func (c *composer) endIdleInput() {
 
 // ── During-turn buffer & queue (fed by the key watcher) ──────────────────────
 
-// insertRunes appends typed (or pasted) runes to the composer buffer.
+// insertRunes inserts typed (or pasted) runes at the caret.
 func (c *composer) insertRunes(rs []rune) {
 	if c == nil || len(rs) == 0 {
 		return
@@ -316,22 +431,150 @@ func (c *composer) insertRunes(rs []rune) {
 	if !c.active {
 		return
 	}
-	c.buf = append(c.buf, rs...)
+	c.clampCur()
+	c.buf = append(c.buf[:c.cur], append(append([]rune{}, rs...), c.buf[c.cur:]...)...)
+	c.cur += len(rs)
 	c.redrawLocked()
 }
 
-// backspace removes the last buffered rune.
+// backspace removes the rune before the caret.
 func (c *composer) backspace() {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.active || len(c.buf) == 0 {
+	c.clampCur()
+	if !c.active || c.cur == 0 {
 		return
 	}
-	c.buf = c.buf[:len(c.buf)-1]
+	c.buf = append(c.buf[:c.cur-1], c.buf[c.cur:]...)
+	c.cur--
 	c.redrawLocked()
+}
+
+// deleteForward removes the rune under the caret (the Delete key).
+func (c *composer) deleteForward() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clampCur()
+	if !c.active || c.cur >= len(c.buf) {
+		return
+	}
+	c.buf = append(c.buf[:c.cur], c.buf[c.cur+1:]...)
+	c.redrawLocked()
+}
+
+// moveCursor shifts the caret by delta runes, clamped to the buffer.
+func (c *composer) moveCursor(delta int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.active {
+		return
+	}
+	before := c.cur
+	c.cur += delta
+	c.clampCur()
+	if c.cur != before {
+		c.redrawLocked()
+	}
+}
+
+// moveCursorTo parks the caret at the start (0) or the end (-1) of the buffer.
+func (c *composer) moveCursorTo(pos int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.active {
+		return
+	}
+	before := c.cur
+	if pos < 0 {
+		c.cur = len(c.buf)
+	} else {
+		c.cur = 0
+	}
+	if c.cur != before {
+		c.redrawLocked()
+	}
+}
+
+// moveWord shifts the caret one word left (dir<0) or right (dir>0), using the
+// readline convention: skip any run of spaces, then the run of non-spaces.
+func (c *composer) moveWord(dir int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.active {
+		return
+	}
+	c.clampCur()
+	before := c.cur
+	if dir < 0 {
+		for c.cur > 0 && c.buf[c.cur-1] == ' ' {
+			c.cur--
+		}
+		for c.cur > 0 && c.buf[c.cur-1] != ' ' {
+			c.cur--
+		}
+	} else {
+		for c.cur < len(c.buf) && c.buf[c.cur] == ' ' {
+			c.cur++
+		}
+		for c.cur < len(c.buf) && c.buf[c.cur] != ' ' {
+			c.cur++
+		}
+	}
+	if c.cur != before {
+		c.redrawLocked()
+	}
+}
+
+// deleteWordBack removes the word before the caret (Ctrl-W).
+func (c *composer) deleteWordBack() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.active {
+		return
+	}
+	c.clampCur()
+	end := c.cur
+	for c.cur > 0 && c.buf[c.cur-1] == ' ' {
+		c.cur--
+	}
+	for c.cur > 0 && c.buf[c.cur-1] != ' ' {
+		c.cur--
+	}
+	if c.cur == end {
+		return
+	}
+	c.buf = append(c.buf[:c.cur], c.buf[end:]...)
+	c.redrawLocked()
+}
+
+// clampCur keeps the caret inside the buffer. Every mutation routes through it
+// because the REPL can swap the buffer out (takeBuffer, enterPressed) between
+// key events.
+func (c *composer) clampCur() {
+	if c.cur < 0 {
+		c.cur = 0
+	}
+	if c.cur > len(c.buf) {
+		c.cur = len(c.buf)
+	}
 }
 
 // clearBuf clears any typed-during-turn text and reports whether there was
@@ -346,7 +589,7 @@ func (c *composer) clearBuf() bool {
 	if !c.active || len(c.buf) == 0 {
 		return false
 	}
-	c.buf = nil
+	c.buf, c.cur = nil, 0
 	c.redrawLocked()
 	return true
 }
@@ -363,7 +606,7 @@ func (c *composer) enterPressed() {
 		return
 	}
 	text := strings.TrimSpace(string(c.buf))
-	c.buf = nil
+	c.buf, c.cur = nil, 0
 	if text != "" {
 		c.queued = append(c.queued, text)
 	}
@@ -398,7 +641,7 @@ func (c *composer) takeBuffer() string {
 		return ""
 	}
 	s := string(c.buf)
-	c.buf = nil
+	c.buf, c.cur = nil, 0
 	c.redrawLocked()
 	return s
 }

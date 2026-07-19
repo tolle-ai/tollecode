@@ -1,5 +1,11 @@
 # Contributor License Agreement
 
+**This document has not been reviewed by a lawyer. Before relying on it, have counsel
+review it against your jurisdiction and your commercial plans. It is adapted from the
+Apache Software Foundation Individual CLA v2.2, with an added relicensing grant.**
+
+---
+
 ## Why this exists
 
 TolleCode is released under the AGPL-3.0. The same code also forms the basis of
